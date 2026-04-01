@@ -132,6 +132,93 @@ def _hpwl(pos, edges, weights):
     return float((weights * (dx + dy)).sum())
 
 
+def _fast_density_cost(pos, sizes, n, cw, ch, grid_size=10):
+    """
+    Fast density cost proxy (mirrors plc_client density formula).
+
+    Rasterizes macros onto a grid_size×grid_size grid using fractional overlap,
+    then returns 0.5 × average of the top 10% most-occupied cells.
+    """
+    cell_w = cw / grid_size
+    cell_h = ch / grid_size
+    cell_area = cell_w * cell_h
+    grid = np.zeros((grid_size, grid_size), dtype=np.float64)
+
+    for i in range(n):
+        hw, hh = sizes[i, 0] / 2, sizes[i, 1] / 2
+        x0, x1 = pos[i, 0] - hw, pos[i, 0] + hw
+        y0, y1 = pos[i, 1] - hh, pos[i, 1] + hh
+
+        col_lo = max(0, int(x0 / cell_w))
+        col_hi = min(grid_size - 1, int(x1 / cell_w))
+        row_lo = max(0, int(y0 / cell_h))
+        row_hi = min(grid_size - 1, int(y1 / cell_h))
+
+        cols = np.arange(col_lo, col_hi + 1)
+        rows = np.arange(row_lo, row_hi + 1)
+        ov_x = np.maximum(0.0, np.minimum(x1, (cols + 1) * cell_w) - np.maximum(x0, cols * cell_w))
+        ov_y = np.maximum(0.0, np.minimum(y1, (rows + 1) * cell_h) - np.maximum(y0, rows * cell_h))
+        grid[row_lo:row_hi + 1, col_lo:col_hi + 1] += np.outer(ov_y, ov_x) / cell_area
+
+    flat = grid.ravel()
+    n_top = max(1, grid_size * grid_size // 10)
+    top10 = np.partition(flat, -n_top)[-n_top:]
+    return 0.5 * float(top10.mean())
+
+
+def _fast_congestion_cost(pos, edges, weights, cw, ch, grid_size=10):
+    """
+    Cut-based congestion proxy.
+
+    For each of the (grid_size-1) vertical and horizontal grid boundaries,
+    sums the weight of nets whose bounding box spans that cut. Normalizes by
+    total net weight. Returns abu(top 10%) of the 2*(grid_size-1) cut values.
+    """
+    if len(edges) == 0:
+        return 0.0
+    total_w = float(weights.sum())
+    if total_w < 1e-9:
+        return 0.0
+
+    cell_w = cw / grid_size
+    cell_h = ch / grid_size
+
+    x0 = np.minimum(pos[edges[:, 0], 0], pos[edges[:, 1], 0])
+    x1 = np.maximum(pos[edges[:, 0], 0], pos[edges[:, 1], 0])
+    y0 = np.minimum(pos[edges[:, 0], 1], pos[edges[:, 1], 1])
+    y1 = np.maximum(pos[edges[:, 0], 1], pos[edges[:, 1], 1])
+
+    v_cuts = np.array([
+        float(weights[(x0 < k * cell_w) & (x1 > k * cell_w)].sum())
+        for k in range(1, grid_size)
+    ]) / total_w
+
+    h_cuts = np.array([
+        float(weights[(y0 < k * cell_h) & (y1 > k * cell_h)].sum())
+        for k in range(1, grid_size)
+    ]) / total_w
+
+    all_cuts = np.concatenate([v_cuts, h_cuts])
+    n_top = max(1, len(all_cuts) // 10)
+    top10 = np.partition(all_cuts, -n_top)[-n_top:]
+    return float(top10.mean())
+
+
+def _proxy_fitness(pos, edges, weights, sizes, n, cw, ch):
+    """
+    Full proxy fitness matching the evaluation metric:
+      normalized_HPWL + 0.5 * density + 0.5 * congestion
+
+    HPWL is normalized by (cw + ch) * total_weight to be commensurate
+    with the density and congestion terms (both in [0, ~1]).
+    """
+    total_w = float(weights.sum()) if len(weights) > 0 else 1.0
+    hpwl_norm = _hpwl(pos, edges, weights) / max((cw + ch) * total_w, 1e-9)
+    density = _fast_density_cost(pos, sizes, n, cw, ch)
+    congestion = _fast_congestion_cost(pos, edges, weights, cw, ch)
+    return hpwl_norm + 0.5 * density + 0.5 * congestion
+
+
 # ---------------------------------------------------------------------------
 # Legalization: spiral search with minimum displacement
 # ---------------------------------------------------------------------------
@@ -578,8 +665,8 @@ class GeneticPlacer:
         steps_per_child = max(150, 2400 // max(self.n_generations, 1))
 
         for gen in range(self.n_generations):
-            # Evaluate HPWL fitness for all individuals
-            fitness = [_hpwl(p, edges, weights) for p in population]
+            # Evaluate proxy fitness for all individuals
+            fitness = [_proxy_fitness(p, edges, weights, sizes, n, cw, ch) for p in population]
 
             # Rank by fitness (lower = better)
             ranked = sorted(range(len(population)), key=lambda i: fitness[i])
@@ -626,16 +713,16 @@ class GeneticPlacer:
 
             population = next_gen
 
-        # Pick best individual by HPWL
-        fitness = [_hpwl(p, edges, weights) for p in population]
+        # Pick best individual by proxy fitness
+        fitness = [_proxy_fitness(p, edges, weights, sizes, n, cw, ch) for p in population]
         best_pos = population[int(np.argmin(fitness))].copy()
 
         # Phase 3: CARDS vacant centroid movement (reduce density/congestion)
-        for _ in range(self.n_cards_passes):
-            best_pos = _vacant_centroid_move(
-                best_pos, movable_mask, sizes, half_w, half_h,
-                cw, ch, sep_x, sep_y, n,
-            )
+        # for _ in range(self.n_cards_passes):
+        #     best_pos = _vacant_centroid_move(
+        #         best_pos, movable_mask, sizes, half_w, half_h,
+        #         cw, ch, sep_x, sep_y, n,
+        #     )
 
         # Final SA polish: tighten wirelength at low temperature
         best_pos = _sa_evolve(
