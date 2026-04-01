@@ -605,8 +605,8 @@ class GeneticPlacer:
         self,
         seed: int = 42,
         pop_size: int = 30,
-        n_generations: int = 60,
-        elite_frac: float = 0.2,
+        n_generations: int = 40,
+        elite_frac: float = 0.33,
         n_cards_passes: int = 3,
     ):
         self.seed = seed
