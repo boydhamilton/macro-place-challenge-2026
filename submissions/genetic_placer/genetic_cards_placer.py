@@ -763,6 +763,7 @@ def _vacant_centroid_move(pos, movable_mask, sizes, half_w, half_h,
     # means there is no connected vacant region large enough to be useful.
     current_density = _fast_density_cost(pos, sizes, n, cw, ch)
     if current_density > 0.45:
+        print("density prohibits cards")
         return pos
 
     cell_w = cw / grid_size
