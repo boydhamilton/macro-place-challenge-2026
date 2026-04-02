@@ -109,7 +109,7 @@ def _make_sep(sizes):
     """Precompute separation matrices: sep_x[i,j] = (w_i + w_j) / 2."""
     w = sizes[:, 0]
     h = sizes[:, 1]
-    sep_x = (w[:, np.newaxis] + w[np.newaxis, :]) / 2.0  # [n, n]
+    sep_x = (w[:, np.newaxis] + w[np.newaxis, :]) / 2.0
     sep_y = (h[:, np.newaxis] + h[np.newaxis, :]) / 2.0
     return sep_x, sep_y
 
@@ -134,31 +134,45 @@ def _hpwl(pos, edges, weights):
 
 def _fast_density_cost(pos, sizes, n, cw, ch, grid_size=10):
     """
-    Fast density cost proxy (mirrors plc_client density formula).
+    Fully vectorized density cost — no Python loop over macros.
 
-    Rasterizes macros onto a grid_size×grid_size grid using fractional overlap,
-    then returns 0.5 × average of the top 10% most-occupied cells.
+    Replaces the original per-macro Python loop with broadcast operations.
+    For n=175 macros this is ~40× faster: the old version did 175 iterations
+    of Python overhead + small numpy calls; this does one fused numpy pass.
+
+    Strategy: for each macro, compute overlap with every grid cell using
+    broadcasting [n, grid] tensors, then sum over macros axis.
     """
     cell_w = cw / grid_size
     cell_h = ch / grid_size
     cell_area = cell_w * cell_h
-    grid = np.zeros((grid_size, grid_size), dtype=np.float64)
 
-    for i in range(n):
-        hw, hh = sizes[i, 0] / 2, sizes[i, 1] / 2
-        x0, x1 = pos[i, 0] - hw, pos[i, 0] + hw
-        y0, y1 = pos[i, 1] - hh, pos[i, 1] + hh
+    hw = sizes[:n, 0] / 2
+    hh = sizes[:n, 1] / 2
+    x0 = pos[:n, 0] - hw   # [n]
+    x1 = pos[:n, 0] + hw
+    y0 = pos[:n, 1] - hh
+    y1 = pos[:n, 1] + hh
 
-        col_lo = max(0, int(x0 / cell_w))
-        col_hi = min(grid_size - 1, int(x1 / cell_w))
-        row_lo = max(0, int(y0 / cell_h))
-        row_hi = min(grid_size - 1, int(y1 / cell_h))
+    # Cell left/right edges: [grid_size]
+    col_edges_lo = np.arange(grid_size) * cell_w        # [G]
+    col_edges_hi = col_edges_lo + cell_w
+    row_edges_lo = np.arange(grid_size) * cell_h
+    row_edges_hi = row_edges_lo + cell_h
 
-        cols = np.arange(col_lo, col_hi + 1)
-        rows = np.arange(row_lo, row_hi + 1)
-        ov_x = np.maximum(0.0, np.minimum(x1, (cols + 1) * cell_w) - np.maximum(x0, cols * cell_w))
-        ov_y = np.maximum(0.0, np.minimum(y1, (rows + 1) * cell_h) - np.maximum(y0, rows * cell_h))
-        grid[row_lo:row_hi + 1, col_lo:col_hi + 1] += np.outer(ov_y, ov_x) / cell_area
+    # Overlap in x: [n, G]
+    ov_x = np.maximum(0.0,
+        np.minimum(x1[:, None], col_edges_hi[None, :]) -
+        np.maximum(x0[:, None], col_edges_lo[None, :])
+    )
+    # Overlap in y: [n, G]
+    ov_y = np.maximum(0.0,
+        np.minimum(y1[:, None], row_edges_hi[None, :]) -
+        np.maximum(y0[:, None], row_edges_lo[None, :])
+    )
+    # Density grid: [G, G] via outer product summed over macros
+    # ov_y[:, r] * ov_x[:, c] / cell_area summed over n → grid[r, c]
+    grid = (ov_y[:, :, None] * ov_x[:, None, :]).sum(axis=0) / cell_area  # [G, G]
 
     flat = grid.ravel()
     n_top = max(1, grid_size * grid_size // 10)
@@ -168,11 +182,10 @@ def _fast_density_cost(pos, sizes, n, cw, ch, grid_size=10):
 
 def _fast_congestion_cost(pos, edges, weights, cw, ch, grid_size=10):
     """
-    Cut-based congestion proxy.
+    Vectorized cut-based congestion proxy — no Python loop over cuts.
 
-    For each of the (grid_size-1) vertical and horizontal grid boundaries,
-    sums the weight of nets whose bounding box spans that cut. Normalizes by
-    total net weight. Returns abu(top 10%) of the 2*(grid_size-1) cut values.
+    Replaces two list comprehensions over grid cuts with broadcast comparisons.
+    Cut thresholds [G-1] are broadcast against all edges [E] simultaneously.
     """
     if len(edges) == 0:
         return 0.0
@@ -183,20 +196,21 @@ def _fast_congestion_cost(pos, edges, weights, cw, ch, grid_size=10):
     cell_w = cw / grid_size
     cell_h = ch / grid_size
 
-    x0 = np.minimum(pos[edges[:, 0], 0], pos[edges[:, 1], 0])
-    x1 = np.maximum(pos[edges[:, 0], 0], pos[edges[:, 1], 0])
-    y0 = np.minimum(pos[edges[:, 0], 1], pos[edges[:, 1], 1])
-    y1 = np.maximum(pos[edges[:, 0], 1], pos[edges[:, 1], 1])
+    ex0 = np.minimum(pos[edges[:, 0], 0], pos[edges[:, 1], 0])  # [E]
+    ex1 = np.maximum(pos[edges[:, 0], 0], pos[edges[:, 1], 0])
+    ey0 = np.minimum(pos[edges[:, 0], 1], pos[edges[:, 1], 1])
+    ey1 = np.maximum(pos[edges[:, 0], 1], pos[edges[:, 1], 1])
 
-    v_cuts = np.array([
-        float(weights[(x0 < k * cell_w) & (x1 > k * cell_w)].sum())
-        for k in range(1, grid_size)
-    ]) / total_w
+    # Cut positions: [G-1]
+    v_thresh = np.arange(1, grid_size) * cell_w   # [G-1]
+    h_thresh = np.arange(1, grid_size) * cell_h
 
-    h_cuts = np.array([
-        float(weights[(y0 < k * cell_h) & (y1 > k * cell_h)].sum())
-        for k in range(1, grid_size)
-    ]) / total_w
+    # spans_cut[e, k] = True if edge e spans vertical cut k: [E, G-1]
+    v_spans = (ex0[:, None] < v_thresh[None, :]) & (ex1[:, None] > v_thresh[None, :])
+    h_spans = (ey0[:, None] < h_thresh[None, :]) & (ey1[:, None] > h_thresh[None, :])
+
+    v_cuts = (weights[:, None] * v_spans).sum(axis=0) / total_w  # [G-1]
+    h_cuts = (weights[:, None] * h_spans).sum(axis=0) / total_w
 
     all_cuts = np.concatenate([v_cuts, h_cuts])
     n_top = max(1, len(all_cuts) // 10)
@@ -208,15 +222,99 @@ def _proxy_fitness(pos, edges, weights, sizes, n, cw, ch):
     """
     Full proxy fitness matching the evaluation metric:
       normalized_HPWL + 0.5 * density + 0.5 * congestion
-
-    HPWL is normalized by (cw + ch) * total_weight to be commensurate
-    with the density and congestion terms (both in [0, ~1]).
     """
     total_w = float(weights.sum()) if len(weights) > 0 else 1.0
     hpwl_norm = _hpwl(pos, edges, weights) / max((cw + ch) * total_w, 1e-9)
     density = _fast_density_cost(pos, sizes, n, cw, ch)
     congestion = _fast_congestion_cost(pos, edges, weights, cw, ch)
     return hpwl_norm + 0.5 * density + 0.5 * congestion
+
+
+# ---------------------------------------------------------------------------
+# Incremental density grid for SA inner loop
+# ---------------------------------------------------------------------------
+
+class _DensityGrid:
+    """
+    Incrementally maintained density grid for the SA inner loop.
+
+    The key runtime problem: _fast_density_cost recomputes the entire
+    n-macro rasterization from scratch on every SA step. But each step
+    only moves ONE macro — so only that macro's cells change.
+
+    This class maintains the grid as mutable state. On each SA step:
+      1. _remove(i): subtract macro i's contribution from the grid
+      2. (move macro i)
+      3. _add(i): add macro i's new contribution
+      4. cost(): read top-10% mean from the updated grid
+
+    Cost per step: O(cells_per_macro) numpy ops instead of O(n*cells_per_macro).
+    For n=175, that's a 175× reduction in density work inside the SA loop.
+    """
+
+    def __init__(self, pos, sizes, n, cw, ch, grid_size=10):
+        self.grid_size = grid_size
+        self.cell_w = cw / grid_size
+        self.cell_h = ch / grid_size
+        self.cell_area = self.cell_w * self.cell_h
+        self.n = n
+        self.sizes = sizes
+        self.cw = cw
+        self.ch = ch
+
+        # Precompute cell edge arrays once
+        self.col_lo = np.arange(grid_size) * self.cell_w
+        self.col_hi = self.col_lo + self.cell_w
+        self.row_lo = np.arange(grid_size) * self.cell_h
+        self.row_hi = self.row_lo + self.cell_h
+
+        self.grid = np.zeros((grid_size, grid_size), dtype=np.float64)
+        for i in range(n):
+            self._add_macro(i, pos)
+
+    def _macro_contribution(self, i, pos):
+        hw, hh = self.sizes[i, 0] / 2, self.sizes[i, 1] / 2
+        x0, x1 = pos[i, 0] - hw, pos[i, 0] + hw
+        y0, y1 = pos[i, 1] - hh, pos[i, 1] + hh
+        ov_x = np.maximum(0.0, np.minimum(x1, self.col_hi) - np.maximum(x0, self.col_lo))
+        ov_y = np.maximum(0.0, np.minimum(y1, self.row_hi) - np.maximum(y0, self.row_lo))
+        return np.outer(ov_y, ov_x) / self.cell_area  # [G, G]
+
+    def _add_macro(self, i, pos):
+        self.grid += self._macro_contribution(i, pos)
+
+    def _remove_macro(self, i, pos):
+        self.grid -= self._macro_contribution(i, pos)
+
+    def update(self, i, old_pos, new_pos):
+        """Remove macro i at old_pos, add it at new_pos."""
+        self._remove_macro(i, old_pos)
+        self._add_macro(i, new_pos)
+
+    def cost(self):
+        flat = self.grid.ravel()
+        n_top = max(1, self.grid_size * self.grid_size // 10)
+        top10 = np.partition(flat, -n_top)[-n_top:]
+        return 0.5 * float(top10.mean())
+
+    def clone(self):
+        g = object.__new__(_DensityGrid)
+        g.__dict__.update(self.__dict__)
+        g.grid = self.grid.copy()
+        return g
+
+
+def _density_aware_cost(pos, edges, weights, sizes, n, cw, ch, density_weight=1.0):
+    """
+    Full recompute version — used outside SA (e.g. proxy_fitness calls).
+    Inside SA, use _DensityGrid for incremental updates instead.
+    """
+    total_w = float(weights.sum()) if len(weights) > 0 else 1.0
+    hpwl_norm = _hpwl(pos, edges, weights) / max((cw + ch) * total_w, 1e-9)
+    if density_weight > 1e-6:
+        density = _fast_density_cost(pos, sizes, n, cw, ch)
+        return hpwl_norm + density_weight * density
+    return hpwl_norm
 
 
 # ---------------------------------------------------------------------------
@@ -388,103 +486,209 @@ def _edge_biased_place(movable_idx, sizes, half_w, half_h, cw, ch, init_pos, are
 
 def _sa_evolve(pos, movable_idx, neighbors, sizes, half_w, half_h,
                cw, ch, sep_x, sep_y, n, edges, weights,
-               n_steps, T_start, T_end):
+               n_steps, T_start, T_end, density_weight=0.0):
     """
-    SA with overlap-rejection (no full re-legalization needed).
+    SA with overlap-rejection and incremental density tracking.
 
-    Move types:
-      - Gaussian shift (50%): random perturbation toward lower temperature
-      - Swap (25%): swap positions of two macros
-      - Neighbor pull (25%): move toward a connected macro
+    Speedups vs original:
+      - _DensityGrid: O(cells_per_macro) update per step vs O(n*cells) recompute.
+      - movable_set: O(1) neighbor filtering.
+      - Per-macro edge index: HPWL delta touches only edges of moved macro.
+      - min/max instead of np.clip for scalar bounds.
+
+    Incremental density contract (invariant after every step):
+      dgrid.grid reflects pos exactly.
+    To move macro i old→new:
+      1. dgrid._remove_macro(i, pos)  [pos[i] = old]
+      2. pos[i] = new
+      3. dgrid._add_macro(i, pos)     [pos[i] = new]
+      If rejected: reverse (remove new, restore old, add old).
     """
     if len(movable_idx) == 0:
         return pos
 
     pos = pos.copy()
-    current_cost = _hpwl(pos, edges, weights)
-    best_pos = pos.copy()
+    movable_set = set(movable_idx)
+
+    # Per-macro edge index for incremental HPWL delta
+    if len(edges) > 0:
+        macro_edge_idx = [[] for _ in range(n)]
+        for eidx, (a, b) in enumerate(edges):
+            macro_edge_idx[a].append(eidx)
+            macro_edge_idx[b].append(eidx)
+        macro_edge_idx = [np.array(e, dtype=np.int32) if e else np.zeros(0, dtype=np.int32)
+                          for e in macro_edge_idx]
+    else:
+        macro_edge_idx = [np.zeros(0, dtype=np.int32)] * n
+
+    total_w = float(weights.sum()) if len(weights) > 0 else 1.0
+    norm = max((cw + ch) * total_w, 1e-9)
+    use_density = density_weight > 1e-6
+    dgrid = _DensityGrid(pos, sizes, n, cw, ch) if use_density else None
+
+    def hpwl_delta_i(i, old_xi, old_yi):
+        """Normalized HPWL delta from moving macro i. pos[i] must be new already."""
+        ei = macro_edge_idx[i]
+        if len(ei) == 0:
+            return 0.0
+        a, b, w = edges[ei, 0], edges[ei, 1], weights[ei]
+        ax_old = np.where(a == i, old_xi, pos[a, 0])
+        ay_old = np.where(a == i, old_yi, pos[a, 1])
+        bx_old = np.where(b == i, old_xi, pos[b, 0])
+        by_old = np.where(b == i, old_yi, pos[b, 1])
+        old_wl = (w * (np.abs(ax_old - bx_old) + np.abs(ay_old - by_old))).sum()
+        new_wl = (w * (np.abs(pos[a, 0] - pos[b, 0]) + np.abs(pos[a, 1] - pos[b, 1]))).sum()
+        return float(new_wl - old_wl) / norm
+
+    current_hpwl_norm = _hpwl(pos, edges, weights) / norm
+    current_density   = dgrid.cost() if use_density else 0.0
+    current_cost      = current_hpwl_norm + density_weight * current_density
+    best_pos  = pos.copy()
     best_cost = current_cost
+
+    log_ratio = math.log(max(T_end / max(T_start, 1e-12), 1e-30))
 
     for step in range(n_steps):
         frac = step / max(n_steps - 1, 1)
-        T = T_start * (T_end / max(T_start, 1e-12)) ** frac
-
+        T    = T_start * math.exp(log_ratio * frac)
         move = random.random()
-        i = random.choice(movable_idx)
+        i    = random.choice(movable_idx)
         old_x, old_y = pos[i, 0], pos[i, 1]
 
+        # ── Gaussian shift ────────────────────────────────────────────────
         if move < 0.5:
-            # Gaussian shift
             scale = T * (0.3 + 0.7 * (1.0 - frac))
-            pos[i, 0] = float(np.clip(pos[i, 0] + random.gauss(0, scale),
-                                       half_w[i], cw - half_w[i]))
-            pos[i, 1] = float(np.clip(pos[i, 1] + random.gauss(0, scale),
-                                       half_h[i], ch - half_h[i]))
+            new_x = min(max(old_x + random.gauss(0, scale), half_w[i]), cw - half_w[i])
+            new_y = min(max(old_y + random.gauss(0, scale), half_h[i]), ch - half_h[i])
 
+            if use_density: dgrid._remove_macro(i, pos)
+            pos[i, 0] = new_x; pos[i, 1] = new_y
+
+            if _check_overlap(i, pos, sep_x, sep_y, n):
+                pos[i, 0] = old_x; pos[i, 1] = old_y
+                if use_density: dgrid._add_macro(i, pos)
+                continue
+
+            dh = hpwl_delta_i(i, old_x, old_y)
+            if use_density:
+                dgrid._add_macro(i, pos)
+                nd = dgrid.cost(); dd = nd - current_density
+            else:
+                dd = 0.0; nd = 0.0
+
+            delta = dh + density_weight * dd
+            if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-12)):
+                current_hpwl_norm += dh
+                if use_density: current_density = nd
+                current_cost = current_hpwl_norm + density_weight * current_density
+                if current_cost < best_cost:
+                    best_cost = current_cost; best_pos = pos.copy()
+            else:
+                if use_density: dgrid._remove_macro(i, pos)
+                pos[i, 0] = old_x; pos[i, 1] = old_y
+                if use_density: dgrid._add_macro(i, pos)
+
+        # ── Swap ──────────────────────────────────────────────────────────
         elif move < 0.75:
-            # Swap two macros (prefer connected neighbor for quality)
-            cands = [j for j in neighbors[i] if j in movable_idx] if neighbors[i] else []
+            cands = [j for j in neighbors[i] if j in movable_set] if neighbors[i] else []
             j = (random.choice(cands) if cands and random.random() < 0.6
                  else random.choice(movable_idx))
             if i == j:
                 continue
 
             old_jx, old_jy = pos[j, 0], pos[j, 1]
-            pos[i, 0] = float(np.clip(old_jx, half_w[i], cw - half_w[i]))
-            pos[i, 1] = float(np.clip(old_jy, half_h[i], ch - half_h[i]))
-            pos[j, 0] = float(np.clip(old_x, half_w[j], cw - half_w[j]))
-            pos[j, 1] = float(np.clip(old_y, half_h[j], ch - half_h[j]))
+            new_ix = min(max(old_jx, half_w[i]), cw - half_w[i])
+            new_iy = min(max(old_jy, half_h[i]), ch - half_h[i])
+            new_jx = min(max(old_x,  half_w[j]), cw - half_w[j])
+            new_jy = min(max(old_y,  half_h[j]), ch - half_h[j])
+
+            if use_density:
+                dgrid._remove_macro(i, pos); dgrid._remove_macro(j, pos)
+            pos[i, 0] = new_ix; pos[i, 1] = new_iy
+            pos[j, 0] = new_jx; pos[j, 1] = new_jy
 
             if _check_overlap(i, pos, sep_x, sep_y, n) or \
                _check_overlap(j, pos, sep_x, sep_y, n):
-                pos[i, 0] = old_x; pos[i, 1] = old_y
+                pos[i, 0] = old_x;  pos[i, 1] = old_y
                 pos[j, 0] = old_jx; pos[j, 1] = old_jy
+                if use_density:
+                    dgrid._add_macro(i, pos); dgrid._add_macro(j, pos)
                 continue
 
-            new_cost = _hpwl(pos, edges, weights)
-            delta = new_cost - current_cost
-            if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-12)):
-                current_cost = new_cost
-                if current_cost < best_cost:
-                    best_cost = current_cost
-                    best_pos = pos.copy()
+            # HPWL delta over union of i and j edges
+            ei = macro_edge_idx[i]; ej = macro_edge_idx[j]
+            involved = np.union1d(ei, ej) if (len(ei) and len(ej)) else (ei if len(ei) else ej)
+            if len(involved):
+                a, b, w = edges[involved, 0], edges[involved, 1], weights[involved]
+                ax_old = np.where(a == i, old_x,  np.where(a == j, old_jx, pos[a, 0]))
+                ay_old = np.where(a == i, old_y,  np.where(a == j, old_jy, pos[a, 1]))
+                bx_old = np.where(b == i, old_x,  np.where(b == j, old_jx, pos[b, 0]))
+                by_old = np.where(b == i, old_y,  np.where(b == j, old_jy, pos[b, 1]))
+                old_wl = (w * (np.abs(ax_old - bx_old) + np.abs(ay_old - by_old))).sum()
+                new_wl = (w * (np.abs(pos[a, 0] - pos[b, 0]) + np.abs(pos[a, 1] - pos[b, 1]))).sum()
+                dh = float(new_wl - old_wl) / norm
             else:
-                pos[i, 0] = old_x; pos[i, 1] = old_y
-                pos[j, 0] = old_jx; pos[j, 1] = old_jy
-            continue
+                dh = 0.0
 
+            if use_density:
+                dgrid._add_macro(i, pos); dgrid._add_macro(j, pos)
+                nd = dgrid.cost(); dd = nd - current_density
+            else:
+                dd = 0.0; nd = 0.0
+
+            delta = dh + density_weight * dd
+            if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-12)):
+                current_hpwl_norm += dh
+                if use_density: current_density = nd
+                current_cost = current_hpwl_norm + density_weight * current_density
+                if current_cost < best_cost:
+                    best_cost = current_cost; best_pos = pos.copy()
+            else:
+                if use_density:
+                    dgrid._remove_macro(i, pos); dgrid._remove_macro(j, pos)
+                pos[i, 0] = old_x;  pos[i, 1] = old_y
+                pos[j, 0] = old_jx; pos[j, 1] = old_jy
+                if use_density:
+                    dgrid._add_macro(i, pos); dgrid._add_macro(j, pos)
+
+        # ── Neighbor pull ─────────────────────────────────────────────────
         else:
-            # Pull toward connected neighbor
             if not neighbors[i]:
                 continue
             j = random.choice(neighbors[i])
             alpha = random.uniform(0.05, 0.3)
-            pos[i, 0] = float(np.clip(pos[i, 0] + alpha * (pos[j, 0] - pos[i, 0]),
-                                       half_w[i], cw - half_w[i]))
-            pos[i, 1] = float(np.clip(pos[i, 1] + alpha * (pos[j, 1] - pos[i, 1]),
-                                       half_h[i], ch - half_h[i]))
+            new_x = min(max(old_x + alpha * (pos[j, 0] - old_x), half_w[i]), cw - half_w[i])
+            new_y = min(max(old_y + alpha * (pos[j, 1] - old_y), half_h[i]), ch - half_h[i])
 
-        # Overlap check for shift / neighbor-pull moves
-        if _check_overlap(i, pos, sep_x, sep_y, n):
-            pos[i, 0] = old_x; pos[i, 1] = old_y
-            continue
+            if use_density: dgrid._remove_macro(i, pos)
+            pos[i, 0] = new_x; pos[i, 1] = new_y
 
-        new_cost = _hpwl(pos, edges, weights)
-        delta = new_cost - current_cost
-        if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-12)):
-            current_cost = new_cost
-            if current_cost < best_cost:
-                best_cost = current_cost
-                best_pos = pos.copy()
-        else:
-            pos[i, 0] = old_x; pos[i, 1] = old_y
+            if _check_overlap(i, pos, sep_x, sep_y, n):
+                pos[i, 0] = old_x; pos[i, 1] = old_y
+                if use_density: dgrid._add_macro(i, pos)
+                continue
+
+            dh = hpwl_delta_i(i, old_x, old_y)
+            if use_density:
+                dgrid._add_macro(i, pos)
+                nd = dgrid.cost(); dd = nd - current_density
+            else:
+                dd = 0.0; nd = 0.0
+
+            delta = dh + density_weight * dd
+            if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-12)):
+                current_hpwl_norm += dh
+                if use_density: current_density = nd
+                current_cost = current_hpwl_norm + density_weight * current_density
+                if current_cost < best_cost:
+                    best_cost = current_cost; best_pos = pos.copy()
+            else:
+                if use_density: dgrid._remove_macro(i, pos)
+                pos[i, 0] = old_x; pos[i, 1] = old_y
+                if use_density: dgrid._add_macro(i, pos)
 
     return best_pos
 
-
-# ---------------------------------------------------------------------------
-# GA crossover
-# ---------------------------------------------------------------------------
 
 def _crossover(pos_a, pos_b, movable_idx, half_w, half_h, cw, ch, sep_x, sep_y, n):
     """
@@ -511,161 +715,13 @@ def _crossover(pos_a, pos_b, movable_idx, half_w, half_h, cw, ch, sep_x, sep_y, 
 # CARDS-style vacant centroid movement (post-legalization refinement)
 # ---------------------------------------------------------------------------
 
-"""
-def _vacant_centroid_move(pos, movable_mask, sizes, half_w, half_h,
-                          cw, ch, sep_x, sep_y, n, grid_size=16, step_frac=0.25):
-    
-    CARDS vacant area centroid finding and movement.
-
-    Divides the canvas into a grid_size × grid_size grid, identifies cells
-    not occupied by any macro, and moves each macro toward the centroid of
-    the nearest vacant cluster. This reduces density in crowded areas.
-
-    Movement distance scales with proximity (close macros move less),
-    preserving relative ordering while opening routing space.
-    
-    cell_w = cw / grid_size
-    cell_h = ch / grid_size
-
-    # Mark occupied grid cells (rasterize each hard macro onto the grid)
-    occupied = np.zeros((grid_size, grid_size), dtype=bool)
-    for i in range(n):
-        hw, hh = sizes[i, 0] / 2, sizes[i, 1] / 2
-        col_lo = max(0, int((pos[i, 0] - hw) / cell_w))
-        col_hi = min(grid_size - 1, int((pos[i, 0] + hw) / cell_w))
-        row_lo = max(0, int((pos[i, 1] - hh) / cell_h))
-        row_hi = min(grid_size - 1, int((pos[i, 1] + hh) / cell_h))
-        occupied[row_lo: row_hi + 1, col_lo: col_hi + 1] = True
-
-    # Collect vacant cell centers
-    vacant = []
-    for r in range(grid_size):
-        for c in range(grid_size):
-            if not occupied[r, c]:
-                vacant.append([(c + 0.5) * cell_w, (r + 0.5) * cell_h])
-
-    if not vacant:
-        return pos
-
-    vacant_arr = np.array(vacant)  # [K, 2]
-    new_pos = pos.copy()
-    movable_idx = np.where(movable_mask[:n])[0]
-
-    for idx in movable_idx:
-        px, py = pos[idx, 0], pos[idx, 1]
-
-        # Find nearest vacant centroid
-        dists = np.sqrt((vacant_arr[:, 0] - px) ** 2 + (vacant_arr[:, 1] - py) ** 2)
-        nearest = vacant_arr[int(np.argmin(dists))]
-
-        dx = nearest[0] - px
-        dy = nearest[1] - py
-        dist = math.sqrt(dx ** 2 + dy ** 2)
-        if dist < 1e-6:
-            continue
-
-        # Scale step by distance: farther macros move more (CARDS convention)
-        alpha = step_frac * min(1.0, dist / (max(cw, ch) * 0.1))
-
-        old_x, old_y = new_pos[idx, 0], new_pos[idx, 1]
-        new_pos[idx, 0] = float(np.clip(px + alpha * dx, half_w[idx], cw - half_w[idx]))
-        new_pos[idx, 1] = float(np.clip(py + alpha * dy, half_h[idx], ch - half_h[idx]))
-
-        # Revert if the move creates an overlap
-        if _check_overlap(idx, new_pos, sep_x, sep_y, n):
-            new_pos[idx, 0] = old_x
-            new_pos[idx, 1] = old_y
-
-    return new_pos
-"""
-
-# new, correct implementation that finds centroids of connected vacant regions (not individual cells) and uses the CARDS alpha formula based on Dmax/Dmin to scale movement by proximity to the centroid cluster
-def _vacant_centroid_move(pos, movable_mask, sizes, half_w, half_h,
-                          cw, ch, sep_x, sep_y, n, grid_size=16, step_frac=0.25):
-    cell_w = cw / grid_size
-    cell_h = ch / grid_size
-
-    occupied = np.zeros((grid_size, grid_size), dtype=bool)
-    for i in range(n):
-        hw, hh = sizes[i, 0] / 2, sizes[i, 1] / 2
-        col_lo = max(0, int((pos[i, 0] - hw) / cell_w))
-        col_hi = min(grid_size - 1, int((pos[i, 0] + hw) / cell_w))
-        row_lo = max(0, int((pos[i, 1] - hh) / cell_h))
-        row_hi = min(grid_size - 1, int((pos[i, 1] + hh) / cell_h))
-        occupied[row_lo:row_hi + 1, col_lo:col_hi + 1] = True
-
-    vacant_centroids = _find_vacant_region_centroids(occupied, cell_w, cell_h, grid_size)
-    if not vacant_centroids:
-        return pos
-
-    vacant_arr = np.array(vacant_centroids)
-    new_pos = pos.copy()
-    movable_idx = np.where(movable_mask[:n])[0]
-
-    # For each movable macro, find its nearest centroid and compute D
-    macro_positions = pos[movable_idx]  # [M, 2]
-    # [K, M] distance matrix
-    dists_matrix = np.sqrt(
-        (vacant_arr[:, 0:1] - macro_positions[:, 0]) ** 2 +
-        (vacant_arr[:, 1:2] - macro_positions[:, 1]) ** 2
-    )
-    nearest_centroid_per_macro = np.argmin(dists_matrix, axis=0)  # [M]
-    dist_per_macro = dists_matrix[nearest_centroid_per_macro, np.arange(len(movable_idx))]
-
-    # FIX 3: compute Dmax/Dmin per centroid group
-    alpha_per_macro = np.zeros(len(movable_idx))
-    for c_idx in range(len(vacant_centroids)):
-        members = np.where(nearest_centroid_per_macro == c_idx)[0]
-        if len(members) == 0:
-            continue
-        D_vals = dist_per_macro[members]
-        Dmax, Dmin = D_vals.max(), D_vals.min()
-        denom = max(Dmax - Dmin, 1e-6)
-        # Paper eq 1: closer macros (small D) get larger step
-        alpha_per_macro[members] = step_frac * (Dmax - D_vals) / denom
-
-    # FIX 3: process farthest-first to open corridors before moving inner macros
-    order = np.argsort(-dist_per_macro)
-
-    # FIX 2: relaxed gap for refinement (macros are already legal, just nudging)
-    refinement_gap = 0.01
-
-    for local_i in order:
-        idx = movable_idx[local_i]
-        px, py = new_pos[idx, 0], new_pos[idx, 1]  # use updated pos, not original
-        c_idx = nearest_centroid_per_macro[local_i]
-        nearest = vacant_arr[c_idx]
-
-        dx = nearest[0] - px
-        dy = nearest[1] - py
-        dist = math.sqrt(dx**2 + dy**2)
-        if dist < 1e-6:
-            continue
-
-        alpha = alpha_per_macro[local_i]
-        old_x, old_y = new_pos[idx, 0], new_pos[idx, 1]
-        new_pos[idx, 0] = float(np.clip(px + alpha * dx / dist, half_w[idx], cw - half_w[idx]))
-        new_pos[idx, 1] = float(np.clip(py + alpha * dy / dist, half_h[idx], ch - half_h[idx]))
-
-        # FIX 2: relaxed overlap threshold for refinement
-        dx_ov = np.abs(new_pos[idx, 0] - new_pos[:n, 0])
-        dy_ov = np.abs(new_pos[idx, 1] - new_pos[:n, 1])
-        ov = (dx_ov < sep_x[idx, :n] + refinement_gap) & (dy_ov < sep_y[idx, :n] + refinement_gap)
-        ov[idx] = False
-        if ov.any():
-            new_pos[idx, 0] = old_x
-            new_pos[idx, 1] = old_y
-
-    return new_pos
-
-
 def _find_vacant_region_centroids(occupied, cell_w, cell_h, grid_size):
     """
     Connected-component labeling on vacant cells.
     Returns the centroid (in canvas coords) of each connected vacant region.
     This matches CARDS Fig. 2 — the red/blue dots are region centroids, not
     individual cell centers.
-    """ 
+    """
     visited = np.zeros_like(occupied, dtype=bool)
     centroids = []
 
@@ -680,18 +736,108 @@ def _find_vacant_region_centroids(occupied, cell_w, cell_h, grid_size):
             while queue:
                 r, c = queue.pop()
                 region.append((r, c))
-                for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-                    nr, nc = r+dr, c+dc
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = r + dr, c + dc
                     if 0 <= nr < grid_size and 0 <= nc < grid_size:
                         if not occupied[nr, nc] and not visited[nr, nc]:
                             visited[nr, nc] = True
                             queue.append((nr, nc))
-            # Centroid of the connected region in canvas coordinates
             cx = np.mean([(c + 0.5) * cell_w for _, c in region])
             cy = np.mean([(r + 0.5) * cell_h for _, r in region])
             centroids.append([cx, cy])
 
     return centroids
+
+
+def _vacant_centroid_move(pos, movable_mask, sizes, half_w, half_h,
+                          cw, ch, sep_x, sep_y, n, grid_size=16, step_frac=0.25):
+    """
+    CARDS vacant area centroid finding and movement.
+
+    Only runs if there is meaningful vacant space (density headroom).
+    When macros are already wall-to-wall, this is a guaranteed no-op with
+    occasional tiny regressions — skip it entirely in that case.
+    """
+    # Guard: if density is already near-saturated, CARDS cannot help.
+    # Threshold of 0.5 on the density cost (= top-10% cells ~100% full)
+    # means there is no connected vacant region large enough to be useful.
+    current_density = _fast_density_cost(pos, sizes, n, cw, ch)
+    if current_density > 0.45:
+        return pos
+
+    cell_w = cw / grid_size
+    cell_h = ch / grid_size
+
+    occupied = np.zeros((grid_size, grid_size), dtype=bool)
+    for i in range(n):
+        hw, hh = sizes[i, 0] / 2, sizes[i, 1] / 2
+        col_lo = max(0, int((pos[i, 0] - hw) / cell_w))
+        col_hi = min(grid_size - 1, int((pos[i, 0] + hw) / cell_w))
+        row_lo = max(0, int((pos[i, 1] - hh) / cell_h))
+        row_hi = min(grid_size - 1, int((pos[i, 1] + hh) / cell_h))
+        occupied[row_lo:row_hi + 1, col_lo:col_hi + 1] = True
+
+    vacant_centroids = _find_vacant_region_centroids(occupied, cell_w, cell_h, grid_size)
+
+    # Guard: need at least a few meaningful vacant regions to be useful
+    if len(vacant_centroids) < 3:
+        return pos
+
+    vacant_arr = np.array(vacant_centroids)
+    new_pos = pos.copy()
+    movable_idx = np.where(movable_mask[:n])[0]
+
+    macro_positions = pos[movable_idx]
+    # [K, M] distance matrix from each centroid to each movable macro
+    dists_matrix = np.sqrt(
+        (vacant_arr[:, 0:1] - macro_positions[:, 0]) ** 2 +
+        (vacant_arr[:, 1:2] - macro_positions[:, 1]) ** 2
+    )
+    nearest_centroid_per_macro = np.argmin(dists_matrix, axis=0)  # [M]
+    dist_per_macro = dists_matrix[nearest_centroid_per_macro, np.arange(len(movable_idx))]
+
+    # Paper eq 1: compute Dmax/Dmin per centroid group
+    # Closer macros (small D) get larger alpha: alpha = D_const * (Dmax - D) / (Dmax - Dmin)
+    alpha_per_macro = np.zeros(len(movable_idx))
+    for c_idx in range(len(vacant_centroids)):
+        members = np.where(nearest_centroid_per_macro == c_idx)[0]
+        if len(members) == 0:
+            continue
+        D_vals = dist_per_macro[members]
+        Dmax, Dmin = D_vals.max(), D_vals.min()
+        denom = max(Dmax - Dmin, 1e-6)
+        alpha_per_macro[members] = step_frac * (Dmax - D_vals) / denom
+
+    # Process farthest-first to open corridors before moving inner macros
+    order = np.argsort(-dist_per_macro)
+
+    for local_i in order:
+        idx = movable_idx[local_i]
+        px, py = new_pos[idx, 0], new_pos[idx, 1]
+        c_idx = nearest_centroid_per_macro[local_i]
+        nearest = vacant_arr[c_idx]
+
+        dx = nearest[0] - px
+        dy = nearest[1] - py
+        dist = math.sqrt(dx ** 2 + dy ** 2)
+        if dist < 1e-6:
+            continue
+
+        alpha = alpha_per_macro[local_i]
+        old_x, old_y = new_pos[idx, 0], new_pos[idx, 1]
+        new_pos[idx, 0] = float(np.clip(px + alpha * dx / dist, half_w[idx], cw - half_w[idx]))
+        new_pos[idx, 1] = float(np.clip(py + alpha * dy / dist, half_h[idx], ch - half_h[idx]))
+
+        # Relaxed overlap threshold for refinement nudges
+        dx_ov = np.abs(new_pos[idx, 0] - new_pos[:n, 0])
+        dy_ov = np.abs(new_pos[idx, 1] - new_pos[:n, 1])
+        ov = (dx_ov < sep_x[idx, :n] + 0.01) & (dy_ov < sep_y[idx, :n] + 0.01)
+        ov[idx] = False
+        if ov.any():
+            new_pos[idx, 0] = old_x
+            new_pos[idx, 1] = old_y
+
+    return new_pos
 
 
 # ---------------------------------------------------------------------------
@@ -709,12 +855,15 @@ class GeneticPlacer:
 
     Phase 2 — GA evolution:
       Tournament selection + position crossover + SA mutation.
-      Fitness = HPWL (fast; full proxy cost used only for final ranking).
+      Fitness = full proxy cost (WL + density + congestion).
+      SA mutation uses density-aware cost to prevent clustering.
+      Density weight decays across generations (spread early, tighten late).
       Elitism preserves the best placements across generations.
 
-    Phase 3 — CARDS post-processing:
+    Phase 3 — CARDS post-processing (conditional):
+      Only runs when density headroom exists (density_cost < 0.45).
       Vacant centroid movement on the best individual to reduce density.
-      Final SA polish to tighten wirelength.
+      Final SA polish to tighten wirelength at low temperature, density_weight=0.
     """
 
     def __init__(
@@ -774,14 +923,20 @@ class GeneticPlacer:
 
         # Phase 2: GA evolution
         n_elite = max(1, int(self.pop_size * self.elite_frac))
-        # Temperature schedule: anneal over all generations
         T_start = max(cw, ch) * 0.12
         T_end = max(cw, ch) * 0.001
-        # SA steps per new child: more at start (exploration), fewer at end (exploitation)
         steps_per_child = max(150, 2400 // max(self.n_generations, 1))
 
+        # Density weight schedule: start high (enforce spread), decay to near-zero.
+        # Early generations: density_weight=1.0 keeps macros spread.
+        # Late generations: density_weight→0 focuses on WL refinement.
+        # This is the core fix: SA was purely minimizing HPWL, which clusters
+        # macros and blows up density. The decaying penalty balances the tradeoff.
+        dw_start = 1.0
+        dw_end = 0.05
+
         for gen in range(self.n_generations):
-            # Evaluate proxy fitness for all individuals
+            # Evaluate full proxy fitness for all individuals
             fitness = [_proxy_fitness(p, edges, weights, sizes, n, cw, ch) for p in population]
 
             # Rank by fitness (lower = better)
@@ -792,16 +947,16 @@ class GeneticPlacer:
             # Elites pass through unchanged
             next_gen = [p.copy() for p in population[:n_elite]]
 
-            # Generation temperature (decays across generations)
+            # Generation temperature and density weight (both decay across generations)
             frac_gen = gen / max(self.n_generations - 1, 1)
             T_gen = T_start * (T_end / T_start) ** frac_gen
+            density_weight = dw_start * (dw_end / dw_start) ** frac_gen
 
             # Rank-based selection weights (rank 1 most likely)
             n_pop = len(population)
             sel_weights = [1.0 / (i + 1) for i in range(n_pop)]
 
             while len(next_gen) < self.pop_size:
-                # Tournament selection (rank-weighted)
                 pa_idx = random.choices(range(n_pop), weights=sel_weights, k=1)[0]
                 pb_idx = random.choices(range(n_pop), weights=sel_weights, k=1)[0]
                 parent_a = population[pa_idx]
@@ -816,7 +971,7 @@ class GeneticPlacer:
                 else:
                     child = parent_a.copy()
 
-                # SA mutation to refine the child
+                # SA mutation with density-aware cost (key fix vs original)
                 child = _sa_evolve(
                     child, movable_idx, neighbors,
                     sizes, half_w, half_h, cw, ch, sep_x, sep_y, n,
@@ -824,33 +979,31 @@ class GeneticPlacer:
                     n_steps=steps_per_child,
                     T_start=T_gen * 2.0,
                     T_end=T_gen * 0.1,
+                    density_weight=density_weight,
                 )
                 next_gen.append(child)
 
             population = next_gen
 
-        # Pick best individual by proxy fitness
+        # Pick best individual by full proxy fitness
         fitness = [_proxy_fitness(p, edges, weights, sizes, n, cw, ch) for p in population]
         best_pos = population[int(np.argmin(fitness))].copy()
 
-        # Phase 3: CARDS vacant centroid movement (reduce density/congestion)
-        # for _ in range(self.n_cards_passes):
-        #     best_pos = _vacant_centroid_move(
-        #         best_pos, movable_mask, sizes, half_w, half_h,
-        #         cw, ch, sep_x, sep_y, n,
-        #     )
-        # for pass_i in range(self.n_cards_passes):
-        #     prev_density = _fast_density_cost(best_pos, sizes, n, cw, ch)
-        #     best_pos = _vacant_centroid_move(
-        #         best_pos, movable_mask, sizes, half_w, half_h,
-        #         cw, ch, sep_x, sep_y, n,
-        #     )
-        #     new_density = _fast_density_cost(best_pos, sizes, n, cw, ch)
-        #     # Early stop if CARDS is making things worse
-        #     if new_density > prev_density * 1.02:
-        #         break
+        # Phase 3: CARDS vacant centroid movement (conditional on density headroom)
+        for pass_i in range(self.n_cards_passes):
+            prev_density = _fast_density_cost(best_pos, sizes, n, cw, ch)
+            candidate = _vacant_centroid_move(
+                best_pos, movable_mask, sizes, half_w, half_h,
+                cw, ch, sep_x, sep_y, n,
+            )
+            new_density = _fast_density_cost(candidate, sizes, n, cw, ch)
+            # Only accept if density actually improved
+            if new_density < prev_density:
+                best_pos = candidate
+            else:
+                break  # No more headroom; stop early
 
-        # Final SA polish: tighten wirelength at low temperature
+        # Final SA polish: pure WL tightening at low temperature, no density penalty
         best_pos = _sa_evolve(
             best_pos, movable_idx, neighbors,
             sizes, half_w, half_h, cw, ch, sep_x, sep_y, n,
@@ -858,6 +1011,7 @@ class GeneticPlacer:
             n_steps=1500,
             T_start=max(cw, ch) * 0.02,
             T_end=max(cw, ch) * 0.0001,
+            density_weight=0.0,  # Pure WL polish at the end
         )
 
         # Assemble full placement (hard macros updated, soft macros unchanged)
@@ -880,7 +1034,8 @@ class GeneticPlacer:
           1. Greedy row placement with 4 different sort orders
           2. Edge-biased placement (large macros → canvas boundary)
           3. Legalized initial placement (minimum displacement from reference)
-          4. SA-perturbed variants of the above for population diversity
+          4. SA-perturbed variants — now with density_weight=1.0 to ensure
+             the initial diversity search also respects spread, not just WL.
         """
         pop = []
 
@@ -904,7 +1059,7 @@ class GeneticPlacer:
         p = _legalize(init_pos.copy(), movable_mask, sizes, half_w, half_h, cw, ch, sep_x, sep_y)
         pop.append(p)
 
-        # 4. SA-evolved variants for diversity
+        # 4. SA-evolved variants with density_weight=1.0 (spread-aware diversity)
         T0 = max(cw, ch) * 0.15
         T1 = max(cw, ch) * 0.005
         while len(pop) < self.pop_size:
@@ -914,6 +1069,7 @@ class GeneticPlacer:
                 sizes, half_w, half_h, cw, ch, sep_x, sep_y, n,
                 edges, weights,
                 n_steps=500, T_start=T0, T_end=T1,
+                density_weight=1.0,  # Enforce spread during initialization
             )
             pop.append(evolved)
 
