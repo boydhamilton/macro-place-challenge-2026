@@ -1,3 +1,5 @@
+placed 15th as of apr 16th 2026
+
 # Partcl/HRT Macro Placement Challenge
 
 <img src="assets/HRT.png" alt="Hudson River Trading" height="80"> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <img src="assets/partcl.png" alt="Partcl" height="80">
